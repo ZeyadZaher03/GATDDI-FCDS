@@ -1,6 +1,10 @@
-# src/infer.py
-import os, json, argparse, heapq, time, math, numpy as np, torch, logging, statistics
-from collections import defaultdict
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Inference for GAT-based DDI with memory-safe candidate generation, rich logging,
+diagnostics on score distribution, and optional temperature calibration.
+"""
+import os, json, argparse, heapq, time, math, numpy as np, torch, logging
 from datetime import datetime
 
 try:
@@ -56,7 +60,10 @@ class Timer:
         self.logger.info(f"[done]  {self.label} in {dt:.2f}s ({mem_str()})")
 
 def fmtn(x):  # nice thousands
-    return f"{x:,}"
+    try:
+        return f"{x:,}"
+    except Exception:
+        return str(x)
 
 # ----------------------------- IO / Model ----------------------------------
 
@@ -84,6 +91,17 @@ def load_model(logger, in_dim):
     logger.info(f"model params={fmtn(count_params(m))}, device={DEVICE}")
     return m
 
+def maybe_load_train_edge_index(logger):
+    p = os.path.join(ART, "train_edge_index.npy")
+    if os.path.exists(p):
+        try:
+            arr = torch.tensor(np.load(p), dtype=torch.long)
+            logger.info(f"[encode graph] using training edge_index: {arr.size()}")
+            return arr
+        except Exception as e:
+            logger.warning(f"[encode graph] failed to load train_edge_index.npy: {e}")
+    return None
+
 def encode_nodes(logger, model, x, edge_index):
     with Timer(logger, "encode nodes (GAT)"):
         with torch.no_grad():
@@ -94,7 +112,7 @@ def encode_nodes(logger, model, x, edge_index):
 def known_undirected_pairs(logger, edge_index):
     ei = edge_index.cpu().numpy()
     known = set()
-    # edge_index is directed (mirrored), we condense to undirected
+    # edge_index is directed (mirrored), condense to undirected
     for u, v in zip(ei[0], ei[1]):
         if u == v:
             continue
@@ -102,6 +120,19 @@ def known_undirected_pairs(logger, edge_index):
         known.add((a, b))
     logger.info(f"known undirected edges≈{fmtn(len(known))}")
     return known
+
+def load_calibration(logger):
+    cal_T = None
+    cal_path = os.path.join(ART, "calibration.json")
+    if os.path.exists(cal_path):
+        try:
+            cal_T = float(json.load(open(cal_path, "r")).get("temperature"))
+            logger.info(f"[calibration] applying temperature T={cal_T:.4f}")
+        except Exception as e:
+            logger.warning(f"[calibration] failed to read temperature: {e}")
+    else:
+        logger.info("[calibration] no calibration.json found; using raw logits")
+    return cal_T
 
 # ------------------------- Candidate generators -----------------------------
 
@@ -169,7 +200,6 @@ def topk_similar_candidates(logger, Xbin, known, per_node=200, block=128):
     logger.info(f"[similarity] per_node={per_node}, block={block}, N={fmtn(N)}, F={F}")
     pop = Xbin.sum(axis=1)  # (N,)
     cand_u, cand_v = [], []
-    total_searched = 0
     blocks = range(0, N, block)
     iterator = blocks if tqdm is None else tqdm(blocks, desc="[similarity] blocks")
     for start in iterator:
@@ -182,7 +212,6 @@ def topk_similar_candidates(logger, Xbin, known, per_node=200, block=128):
             tanimoto[row, i] = -1.0  # remove self
         L = min(N, per_node * 2)
         idx = np.argpartition(-tanimoto, kth=min(L, tanimoto.shape[1]-1), axis=1)[:, :L]
-        added_block = 0
         for row, i in enumerate(range(start, end)):
             js = idx[row]
             scores = tanimoto[row, js]
@@ -196,21 +225,21 @@ def topk_similar_candidates(logger, Xbin, known, per_node=200, block=128):
                 added += 1
                 if added >= per_node:
                     break
-            added_block += added
-        total_searched += (end - start) * N
-        if tqdm is None:
-            logger.debug(f"[similarity] block {start}:{end} added={fmtn(added_block)} ({mem_str()})")
     before = len(cand_u)
     pairs = list(set(zip(cand_u, cand_v)))
-    uu, vv = zip(*pairs) if pairs else ([], [])
+    if pairs:
+        uu, vv = zip(*pairs)
+    else:
+        uu, vv = [], []
     arr_u = torch.tensor(np.array(uu, dtype=np.int64))
     arr_v = torch.tensor(np.array(vv, dtype=np.int64))
-    logger.info(f"[similarity] raw={fmtn(before)} deduped={fmtn(arr_u.numel())} ({100*(1-arr_u.numel()/max(1,before)):.1f}% removed)")
+    removed = 0 if before == 0 else 100*(1-arr_u.numel()/max(1,before))
+    logger.info(f"[similarity] raw={fmtn(before)} deduped={fmtn(arr_u.numel())} ({removed:.1f}% removed)")
     return arr_u, arr_v
 
 # ------------------------------ Scoring -------------------------------------
 
-def score_in_batches(logger, model, z, u, v, batch_edges=262_144, log_every_batches=10):
+def score_in_batches(logger, model, z, u, v, batch_edges=262_144, log_every_batches=10, cal_T=None):
     """Yield (slice, probs) while logging throughput & memory occasionally."""
     m = u.numel()
     if m == 0:
@@ -222,7 +251,10 @@ def score_in_batches(logger, model, z, u, v, batch_edges=262_144, log_every_batc
         edge_idx = torch.stack([u[s:e], v[s:e]], dim=0).to(DEVICE)
         with torch.no_grad():
             logits = model.decode(z, edge_idx).detach().cpu().numpy()
-            probs = 1 / (1 + np.exp(-logits))
+            if cal_T is not None:
+                probs = 1 / (1 + np.exp(-(logits / cal_T)))
+            else:
+                probs = 1 / (1 + np.exp(-logits))
         yield slice(s, e), probs
         batches += 1
         if batches % log_every_batches == 0:
@@ -248,8 +280,21 @@ def summarize_scores(logger, scores):
         "max": float(np.max(scores)),
         "mean": float(np.mean(scores)),
     }
-    logger.info(f"[scores] min={stats['min']:.4f} p50={stats['median']:.4f} max={stats['max']:.4f} mean={stats['mean']:.4f}")
+    logger.info(f"[scores] min={stats['min']:.6f} p50={stats['median']:.6f} max={stats['max']:.6f} mean={stats['mean']:.6f}")
     return stats
+
+def threshold_diag(logger, scores):
+    def frac(x, thr): 
+        return float((x >= thr).mean())
+    diag = {
+        "scored": int(scores.size),
+        "frac_ge_0.50": frac(scores, 0.50),
+        "frac_ge_0.90": frac(scores, 0.90),
+        "frac_ge_0.99": frac(scores, 0.99),
+    }
+    logger.info(f"[diag] scored={diag['scored']:,} | >=0.50={diag['frac_ge_0.50']:.4f} "
+                f">=0.90={diag['frac_ge_0.90']:.4f} >=0.99={diag['frac_ge_0.99']:.4f}")
+    return diag
 
 # --------------------------------- Main -------------------------------------
 
@@ -265,18 +310,34 @@ def main():
     ap.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     ap.add_argument("--log-file", default=os.path.join(ART, "infer.log"))
     ap.add_argument("--log-every-batches", type=int, default=10, help="log after this many scoring batches.")
+    ap.add_argument("--use-train-graph", action="store_true", help="Encode with train_edge_index.npy if present.")
     args = ap.parse_args()
 
     logger = setup_logger(args.log_level, args.log_file)
-    logger.info(f"==== DDI-GAT INFER v1 ====")
+    logger.info(f"==== DDI-GAT INFER v2 ====")
     logger.info(f"cmd: mode={args.mode} topk={args.topk} per_node={args.per_node} sample_pairs={fmtn(args.sample_pairs)} "
                 f"chunk_pairs={fmtn(args.chunk_pairs)} batch_edges={fmtn(args.batch_edges)} ({mem_str()})")
 
-    x, edge_index, rev_id = load_artifacts(logger)
+    x, edge_index_full, rev_id = load_artifacts(logger)
     model = load_model(logger, in_dim=x.size(1))
-    z = encode_nodes(logger, model, x, edge_index)
+
+    # Choose graph for encoding
+    encode_ei = edge_index_full
+    if args.use_train_graph:
+        tr_ei = maybe_load_train_edge_index(logger)
+        if tr_ei is not None:
+            encode_ei = tr_ei
+
+    z = encode_nodes(logger, model, x, encode_ei)
     N = x.size(0)
-    known = known_undirected_pairs(logger, edge_index)
+    known = known_undirected_pairs(logger, edge_index_full)
+    cal_T = load_calibration(logger)
+
+    summary = {
+        "mode": args.mode, "N": N, "known_edges": len(known),
+        "topk": int(args.topk), "batch_edges": int(args.batch_edges),
+        "device": DEVICE, "ts": datetime.utcnow().isoformat() + "Z",
+    }
 
     # Candidates
     if args.mode == "similarity":
@@ -284,13 +345,15 @@ def main():
             Xbin = x.numpy().astype(np.float32)  # vectors are 0/1 floats
             u, v = topk_similar_candidates(logger, Xbin, known, per_node=args.per_node, block=128)
         logger.info(f"candidates={fmtn(u.numel())}")
+        summary["candidates"] = int(u.numel())
         # Score and keep global top-K
         scores = np.empty(u.numel(), dtype=np.float32)
-        k = 0
         with Timer(logger, f"scoring {fmtn(u.numel())} candidates"):
+            k = 0
             for sl, probs in score_in_batches(logger, model, z, u, v,
                                               batch_edges=args.batch_edges,
-                                              log_every_batches=args.log_every_batches):
+                                              log_every_batches=args.log_every_batches,
+                                              cal_T=cal_T):
                 scores[sl] = probs
         K = min(args.topk, scores.size)
         top_idx = np.argpartition(-scores, K-1)[:K]
@@ -299,12 +362,8 @@ def main():
         out = os.path.join(ART, "topk_predictions.csv")
         write_topk_csv(logger, rev_id, top_pairs, out)
         stats = summarize_scores(logger, scores[top_sorted])
-        # summary file
-        summary = {
-            "mode": args.mode, "N": N, "known_edges": len(known),
-            "candidates": int(u.numel()), "topk": int(K),
-            "batch_edges": int(args.batch_edges), "device": DEVICE, "score_stats": stats,
-        }
+        diag = threshold_diag(logger, scores)
+        summary.update({"score_stats": stats, "diagnostics_all": diag})
         json.dump(summary, open(os.path.join(ART, "infer_summary.json"), "w"), indent=2)
         logger.info(f"[OK] Summary → {os.path.join(ART,'infer_summary.json')}")
 
@@ -312,11 +371,13 @@ def main():
         with Timer(logger, "candidate selection (random sample)"):
             u, v = random_unknown_samples(logger, N, known, max_pairs=args.sample_pairs)
         logger.info(f"candidates={fmtn(u.numel())}")
+        summary["candidates"] = int(u.numel())
         scores = np.empty(u.numel(), dtype=np.float32)
         with Timer(logger, f"scoring {fmtn(u.numel())} candidates"):
             for sl, probs in score_in_batches(logger, model, z, u, v,
                                               batch_edges=args.batch_edges,
-                                              log_every_batches=args.log_every_batches):
+                                              log_every_batches=args.log_every_batches,
+                                              cal_T=cal_T):
                 scores[sl] = probs
         K = min(args.topk, scores.size)
         top_idx = np.argpartition(-scores, K-1)[:K]
@@ -325,11 +386,8 @@ def main():
         out = os.path.join(ART, "topk_predictions.csv")
         write_topk_csv(logger, rev_id, top_pairs, out)
         stats = summarize_scores(logger, scores[top_sorted])
-        summary = {
-            "mode": args.mode, "N": N, "known_edges": len(known),
-            "candidates": int(u.numel()), "topk": int(K),
-            "batch_edges": int(args.batch_edges), "device": DEVICE, "score_stats": stats,
-        }
+        diag = threshold_diag(logger, scores)
+        summary.update({"score_stats": stats, "diagnostics_all": diag})
         json.dump(summary, open(os.path.join(ART, "infer_summary.json"), "w"), indent=2)
         logger.info(f"[OK] Summary → {os.path.join(ART,'infer_summary.json')}")
 
@@ -341,7 +399,8 @@ def main():
             for cu, cv in iter_all_unknown_pairs(logger, N, known, chunk_pairs=args.chunk_pairs, log_every=1000):
                 for sl, probs in score_in_batches(logger, model, z, cu, cv,
                                                   batch_edges=args.batch_edges,
-                                                  log_every_batches=args.log_every_batches):
+                                                  log_every_batches=args.log_every_batches,
+                                                  cal_T=cal_T):
                     uu = cu[sl].numpy(); vv = cv[sl].numpy()
                     for p, i, j in zip(probs, uu, vv):
                         if len(top_heap) < args.topk:
@@ -354,13 +413,10 @@ def main():
                         logger.info(f"[all] scored {fmtn(total_scored)} pairs… ({mem_str()})")
         out = os.path.join(ART, "topk_predictions.csv")
         write_topk_csv(logger, rev_id, top_heap, out)
-        sc = [s for (s, _, _) in top_heap]
-        stats = summarize_scores(logger, np.array(sc, dtype=np.float32))
-        summary = {
-            "mode": args.mode, "N": N, "known_edges": len(known),
-            "candidates": "ALL-streamed", "topk": int(args.topk),
-            "batch_edges": int(args.batch_edges), "device": DEVICE, "score_stats": stats,
-        }
+        sc = np.array([s for (s, _, _) in top_heap], dtype=np.float32)
+        stats = summarize_scores(logger, sc)
+        diag = threshold_diag(logger, sc)
+        summary.update({"score_stats": stats, "candidates": "ALL-streamed"})
         json.dump(summary, open(os.path.join(ART, "infer_summary.json"), "w"), indent=2)
         logger.info(f"[OK] Summary → {os.path.join(ART,'infer_summary.json')}")
 
